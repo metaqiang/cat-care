@@ -6,22 +6,40 @@ import threading
 import time
 from smbus2 import SMBus
 from sgp30 import Sgp30
-from gpiozero import AngularServo
+import RPi.GPIO as GPIO
 
 app = Flask(__name__)
 swagger_config = Swagger.DEFAULT_CONFIG
 
-Swagger(app, config=swagger_config, template={
-    "swagger": "2.0",
-    "uiversion": 3,
-})
+Swagger(
+    app,
+    config=swagger_config,
+    template={
+        "swagger": "2.0",
+        "uiversion": 3,
+    },
+)
 
 DHT_SENSOR = Adafruit_DHT.DHT11
 DHT_PIN = 4
 
 # --- MG90S Servo Motor ---
-SERVO_PIN = 27
-servo = AngularServo(SERVO_PIN, min_angle=0, max_angle=180, min_pulse_width=0.0005, max_pulse_width=0.0025)
+SERVO_PIN = 26
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+
+# Start PWM with 50Hz frequency
+servo_pwm = GPIO.PWM(SERVO_PIN, 50)
+servo_pwm.start(0)
+
+
+def set_servo_angle_hw(angle):
+    """Control servo angle using PWM"""
+    duty_cycle = (angle / 18) + 2.5  # Convert angle to duty cycle
+    servo_pwm.ChangeDutyCycle(duty_cycle)
+    time.sleep(0.8)  # Wait for servo to reach and stabilize at target position
+    servo_pwm.ChangeDutyCycle(0)  # Stop PWM signal to prevent jitter
+
 
 # --- SGP30 Air Quality Sensor ---
 class AirQualitySensor:
@@ -30,12 +48,12 @@ class AirQualitySensor:
         self.tvoc = None
         self.bus = None
         self.sgp = None
-        
+
         self.keep_running = True
         self.thread = threading.Thread(target=self._read_loop)
         self.thread.daemon = True
         self.thread.start()
-    
+
     def _read_loop(self):
         """Background thread: continuously read CO2 and TVOC from SGP30"""
         try:
@@ -43,7 +61,7 @@ class AirQualitySensor:
             self.sgp = Sgp30(self.bus, baseline_filename="/tmp/mySGP30_baseline")
             self.sgp.init_sgp()
             time.sleep(10)  # Warm-up time
-            
+
             while self.keep_running:
                 try:
                     result = self.sgp.read_measurements()
@@ -51,16 +69,16 @@ class AirQualitySensor:
                         self.co2 = result.data[0]
                         self.tvoc = result.data[1]
                 except Exception:
-                    pass  # 读取失败时静默处理，保持原值
-                
+                    pass  # Silently handle read failures, keep previous values
+
                 time.sleep(1)
         except Exception:
-            pass  # 初始化失败时静默处理，co2/tvoc 保持 None
-    
+            pass  # Silently handle init failures, co2/tvoc remain None
+
     def get_readings(self):
         """Get current CO2 and TVOC readings"""
         return self.co2, self.tvoc
-    
+
     def __del__(self):
         self.keep_running = False
         if self.bus:
@@ -69,23 +87,24 @@ class AirQualitySensor:
             except Exception:
                 pass
 
+
 # --- Optimization 1: global singleton camera class ---
 class VideoCamera(object):
     def __init__(self):
         # 0 refers to the first camera device
         self.video = cv2.VideoCapture(0)
-        
+
         # --- Optimization 2: lower resolution ---
         # 320x240 is sufficient for remote monitoring and reduces bandwidth to about 1/4
         self.video.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
         self.video.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-        
+
         # Try to set hardware FPS; many cameras don't support it, so we control the rate in the thread
-        self.video.set(cv2.CAP_PROP_FPS, 10) 
+        self.video.set(cv2.CAP_PROP_FPS, 10)
 
         self.lock = threading.Lock()
         self.frame = None
-        
+
         # Start a background thread to read frames to avoid blocking web responses
         self.keep_running = True
         self.thread = threading.Thread(target=self._capture_loop)
@@ -101,15 +120,15 @@ class VideoCamera(object):
                 # Quality set to 70 as a trade-off between image quality and bandwidth
                 # (can be lowered to 40-50 to reduce bandwidth further)
                 encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
-                ret, jpeg = cv2.imencode('.jpg', image, encode_param)
-                
+                ret, jpeg = cv2.imencode(".jpg", image, encode_param)
+
                 if ret:
                     with self.lock:
                         self.frame = jpeg.tobytes()
-            
+
             # --- Optimization 4: physical rate limiting ---
             # Sleep to limit FPS to ~10-12 fps, saving CPU and bandwidth
-            time.sleep(0.1) 
+            time.sleep(0.1)
 
     def get_frame(self):
         """Get the current latest frame"""
@@ -121,6 +140,7 @@ class VideoCamera(object):
         if self.video.isOpened():
             self.video.release()
 
+
 # Initialize global camera object (singleton)
 # This ensures only one camera connection is opened regardless of concurrent users
 global_camera = VideoCamera()
@@ -128,27 +148,33 @@ global_camera = VideoCamera()
 # Initialize global air quality sensor (singleton)
 global_air_sensor = AirQualitySensor()
 
+
 def gen(camera):
     while True:
         frame = camera.get_frame()
         if frame is not None:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
-        
+            yield (
+                b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n\r\n"
+            )
+
         # Control the send frequency to clients to avoid sending too fast
         time.sleep(0.1)
 
-@app.route('/')
-def index():
-    return render_template('index.html')
 
-@app.route('/video_feed')
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/video_feed")
 def video_feed():
     # Use the global `global_camera` instead of creating a new VideoCamera each time
-    return Response(gen(global_camera),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(
+        gen(global_camera), mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
 
-@app.route('/sensor_readings', methods=['GET'])
+
+@app.route("/sensor_readings", methods=["GET"])
 def get_sensor_readings():
     """Get sensor readings
     ---
@@ -158,16 +184,29 @@ def get_sensor_readings():
     """
     humidity, temperature = Adafruit_DHT.read_retry(DHT_SENSOR, DHT_PIN)
     co2, tvoc = global_air_sensor.get_readings()
-    
-    return jsonify({
-            'temperature': temperature,
-            'humidity': humidity,
-            'co2': co2,
-            'tvoc': tvoc
-        }), 200
+
+    return (
+        jsonify(
+            {"temperature": temperature, "humidity": humidity, "co2": co2, "tvoc": tvoc}
+        ),
+        200,
+    )
 
 
-@app.route('/servo', methods=['POST'])
+@app.route("/feed", methods=["GET"])
+def feed():
+    """Trigger feeding action
+    ---
+    responses:
+      200:
+        description: Feeding action completed successfully
+    """
+    set_servo_angle_hw(150)
+    set_servo_angle_hw(180)
+    return jsonify({"status": "success", "message": "Feeding completed"}), 200
+
+
+@app.route("/servo", methods=["POST"])
 def set_servo_angle():
     """Set servo angle
     ---
@@ -184,17 +223,17 @@ def set_servo_angle():
         description: Servo angle set successfully
     """
     data = request.get_json()
-    angle = data.get('angle')
-    
+    angle = data.get("angle")
+
     if angle is None:
-        return jsonify({'error': 'angle is required'}), 400
-    
+        return jsonify({"error": "angle is required"}), 400
+
     if not (0 <= angle <= 180):
-        return jsonify({'error': 'angle must be between 0 and 180'}), 400
-    
-    servo.angle = angle
-    return jsonify({'angle': angle}), 200
+        return jsonify({"error": "angle must be between 0 and 180"}), 400
+
+    set_servo_angle(angle)
+    return jsonify({"angle": angle}), 200
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
