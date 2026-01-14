@@ -4,6 +4,7 @@ import Adafruit_DHT
 from flasgger import Swagger
 import threading
 import time
+from datetime import datetime
 from smbus2 import SMBus
 from sgp30 import Sgp30
 import RPi.GPIO as GPIO
@@ -100,10 +101,16 @@ class VideoCamera(object):
         self.video.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
         # Try to set hardware FPS; many cameras don't support it, so we control the rate in the thread
-        self.video.set(cv2.CAP_PROP_FPS, 10)
+        self.video.set(cv2.CAP_PROP_FPS, 15)
 
-        self.lock = threading.Lock()
+        # Reduce camera buffer to minimize latency (get freshest frame)
+        self.video.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         self.frame = None
+        self.frame_id = 0  # Frame counter for tracking new frames
+
+        # Use Condition for efficient new-frame notification
+        self.condition = threading.Condition()
 
         # Start a background thread to read frames to avoid blocking web responses
         self.keep_running = True
@@ -116,6 +123,31 @@ class VideoCamera(object):
         while self.keep_running:
             success, image = self.video.read()
             if success:
+                # Add timestamp overlay on the frame
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # Draw shadow first (offset by 1 pixel) for better visibility
+                cv2.putText(
+                    image,
+                    timestamp,
+                    (11, 26),  # Shadow position: slightly offset
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,  # Font scale
+                    (0, 0, 0),  # Black shadow
+                    2,  # Thickness
+                    cv2.LINE_AA,
+                )
+                # Draw main text on top
+                cv2.putText(
+                    image,
+                    timestamp,
+                    (10, 25),  # Position: top-left corner
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),  # White text
+                    1,
+                    cv2.LINE_AA,
+                )
+
                 # --- Optimization 3: JPEG compression quality ---
                 # Quality set to 70 as a trade-off between image quality and bandwidth
                 # (can be lowered to 40-50 to reduce bandwidth further)
@@ -123,16 +155,33 @@ class VideoCamera(object):
                 ret, jpeg = cv2.imencode(".jpg", image, encode_param)
 
                 if ret:
-                    with self.lock:
+                    with self.condition:
                         self.frame = jpeg.tobytes()
+                        self.frame_id += 1
+                        # Notify all waiting clients that a new frame is available
+                        self.condition.notify_all()
 
             # --- Optimization 4: physical rate limiting ---
-            # Sleep to limit FPS to ~10-12 fps, saving CPU and bandwidth
-            time.sleep(0.1)
+            # Sleep to limit FPS to ~12-15 fps, saving CPU and bandwidth
+            time.sleep(0.07)
+
+    def get_frame_blocking(self, last_frame_id=0, timeout=1.0):
+        """
+        Wait for a new frame and return it.
+        Returns (frame_bytes, frame_id) or (None, last_frame_id) on timeout.
+        This ensures clients always get the latest frame without polling.
+        """
+        with self.condition:
+            # Wait until a newer frame is available or timeout
+            if self.frame_id <= last_frame_id:
+                self.condition.wait(timeout=timeout)
+
+            # Return current frame and its ID
+            return self.frame, self.frame_id
 
     def get_frame(self):
-        """Get the current latest frame"""
-        with self.lock:
+        """Get the current latest frame (non-blocking, for compatibility)"""
+        with self.condition:
             return self.frame
 
     def __del__(self):
@@ -150,15 +199,21 @@ global_air_sensor = AirQualitySensor()
 
 
 def gen(camera):
+    """
+    Generator that yields video frames for MJPEG streaming.
+    Uses blocking wait to ensure each client always receives the latest frame.
+    """
+    last_frame_id = 0
+
     while True:
-        frame = camera.get_frame()
-        if frame is not None:
+        # Block until a new frame is available (no polling, no duplicate frames)
+        frame, frame_id = camera.get_frame_blocking(last_frame_id, timeout=1.0)
+
+        if frame is not None and frame_id > last_frame_id:
+            last_frame_id = frame_id
             yield (
                 b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n\r\n"
             )
-
-        # Control the send frequency to clients to avoid sending too fast
-        time.sleep(0.1)
 
 
 @app.route("/")
